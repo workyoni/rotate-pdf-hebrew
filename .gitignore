@@ -221,3 +221,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Bundled OCR & PyInstaller spec
+tesseract_bundle/
+*.spec
+.DS_Store
