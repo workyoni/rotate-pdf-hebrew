@@ -5,6 +5,8 @@ import shutil
 import sys
 import threading
 import tkinter as tk
+import urllib.request
+import zipfile
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -12,31 +14,102 @@ import fitz  # PyMuPDF
 from PIL import Image, ImageTk
 import pytesseract
 
+# אופציונלי: כתובת ישירה לקובץ ZIP מוכן של Tesseract ל-Windows (למשל מ-GitHub Releases)
+TESSERACT_WIN_ZIP_URL = ""
+HEB_TRAINEDDATA_URL = "https://github.com/tesseract-ocr/tessdata_fast/raw/main/heb.traineddata"
 
-def configure_tesseract() -> None:
-    """מאתר את tesseract.exe המובנה בתוך ה-EXE או מותקן במערכת."""
+
+def get_app_data_dir() -> Path:
+    """מחזיר תיקיית נתונים קבועה למשתמש ב-Windows או macOS."""
+    if sys.platform == "win32":
+        base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    else:
+        base = Path.home() / "Library" / "Application Support"
+    app_dir = base / "RotatePdfHebrew"
+    app_dir.mkdir(parents=True, exist_ok=True)
+    return app_dir
+
+
+def _set_tesseract_from_dir(tess_dir: Path) -> bool:
+    """מגדיר tesseract ואת tessdata מתוך תיקייה קיימת אם הם קיימים."""
+    exe_name = "tesseract.exe" if sys.platform == "win32" else "tesseract"
+    exe_path = tess_dir / exe_name
+    tessdata_dir = tess_dir / "tessdata"
+    if exe_path.exists():
+        pytesseract.pytesseract.tesseract_cmd = str(exe_path)
+        if tessdata_dir.exists():
+            os.environ["TESSDATA_PREFIX"] = str(tessdata_dir)
+        return True
+    return False
+
+
+def _find_existing_tesseract() -> bool:
+    """בודק אם Tesseract כבר הורד לתיקיית האפליקציה או מותקן במערכת."""
+    if _set_tesseract_from_dir(get_app_data_dir() / "tesseract"):
+        return True
+
     base_path = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
-    bundled_tesseract = base_path / "tesseract_bundle" / "tesseract.exe"
-    bundled_tessdata = base_path / "tesseract_bundle" / "tessdata"
-
-    if bundled_tesseract.exists():
-        pytesseract.pytesseract.tesseract_cmd = str(bundled_tesseract)
-        if bundled_tessdata.exists():
-            os.environ["TESSDATA_PREFIX"] = str(bundled_tessdata)
-        return
+    if _set_tesseract_from_dir(base_path / "tesseract_bundle"):
+        return True
 
     if shutil.which("tesseract"):
-        return
+        return True
 
     candidates = [
         r"C:\Program Files\Tesseract-OCR\tesseract.exe",
         r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
         os.path.expandvars(r"%LOCALAPPDATA%\Programs\Tesseract-OCR\tesseract.exe"),
+        "/opt/homebrew/bin/tesseract",
+        "/usr/local/bin/tesseract",
     ]
     for path in candidates:
         if os.path.exists(path):
             pytesseract.pytesseract.tesseract_cmd = path
-            return
+            tessdata_guess = Path(path).parent / "tessdata"
+            if tessdata_guess.exists() and "TESSDATA_PREFIX" not in os.environ:
+                os.environ["TESSDATA_PREFIX"] = str(tessdata_guess)
+            return True
+
+    return False
+
+
+def ensure_tesseract_available() -> None:
+    """מוודא שיש מנוע OCR זמין; אם חסר, מציע להוריד אותו פעם אחת."""
+    if _find_existing_tesseract():
+        return
+
+    answer = messagebox.askyesno(
+        "הורדת מנוע זיהוי טקסט (OCR)",
+        "מנוע זיהוי הטקסט בעברית (Tesseract) לא נמצא במחשב.\n"
+        "האם להוריד ולהתקין אותו כעת לתיקיית המשתמש (פעם אחת בלבד)?",
+    )
+    if not answer:
+        return
+
+    target_dir = get_app_data_dir() / "tesseract"
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        if sys.platform == "win32" and TESSERACT_WIN_ZIP_URL:
+            zip_path = get_app_data_dir() / "tesseract_win.zip"
+            urllib.request.urlretrieve(TESSERACT_WIN_ZIP_URL, zip_path)
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                zf.extractall(target_dir)
+            zip_path.unlink(missing_ok=True)
+            _set_tesseract_from_dir(target_dir)
+        else:
+            tessdata_dir = target_dir / "tessdata"
+            tessdata_dir.mkdir(parents=True, exist_ok=True)
+            urllib.request.urlretrieve(HEB_TRAINEDDATA_URL, tessdata_dir / "heb.traineddata")
+            os.environ["TESSDATA_PREFIX"] = str(tessdata_dir)
+
+        messagebox.showinfo("הושלם", "ההורדה הסתיימה בהצלחה.")
+    except Exception as exc:
+        messagebox.showwarning(
+            "שגיאה בהורדה",
+            f"לא ניתן להוריד את חבילת ה-OCR כעת:\n{exc}\n\n"
+            "התוכנה עדיין תפעל, אך סיבוב ידני יידרש לעמודים ללא זיהוי אוטומטי.",
+        )
 
 
 def count_hebrew_chars(img: Image.Image) -> int:
@@ -80,6 +153,7 @@ def detect_rotation_angle(page: fitz.Page, dpi: int = 220) -> int:
             return 0
         return angle
 
+    # גיבוי מלא אם OSD נכשל
     best_angle = 0
     best_score = -1
     for candidate in (0, 90, 180, 270):
@@ -99,7 +173,7 @@ class PdfStraightenerApp:
         self.root.geometry("1120x740")
         self.root.minsize(900, 620)
 
-        configure_tesseract()
+        ensure_tesseract_available()
 
         self.files_data: list[dict] = []
         self.current_file_idx: int = 0
