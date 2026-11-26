@@ -11,7 +11,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 import fitz  # PyMuPDF
-from PIL import Image, ImageTk
+from PIL import Image, ImageStat, ImageTk
 import pytesseract
 
 # אופציונלי: כתובת ישירה לקובץ ZIP מוכן של Tesseract ל-Windows (למשל מ-GitHub Releases)
@@ -112,6 +112,56 @@ def ensure_tesseract_available() -> None:
         )
 
 
+def is_blank_page(img: Image.Image, white_threshold: int = 245, non_white_ratio_limit: float = 0.003) -> bool:
+    """
+    בודק אם הדף חלק (לבן כמעט לחלוטין).
+    מתעלם מ-2% שוליים כדי שלא יוטעה ממסגרות סריקה דקות.
+    """
+    gray = img.convert("L")
+    w, h = gray.size
+    margin_x = int(w * 0.02)
+    margin_y = int(h * 0.02)
+    if w > 40 and h > 40:
+        gray = gray.crop((margin_x, margin_y, w - margin_x, h - margin_y))
+
+    stat = ImageStat.Stat(gray)
+    # אם סטיית התקן אפסית והממוצע בהיר מאוד — הדף חלק לגמרי
+    if stat.stddev[0] < 3.0 and stat.mean[0] > 240:
+        return True
+
+    hist = gray.histogram()
+    total_pixels = sum(hist)
+    if total_pixels == 0:
+        return True
+
+    dark_pixels = sum(hist[:white_threshold])
+    return (dark_pixels / total_pixels) < non_white_ratio_limit
+
+
+def ensure_portrait_angle(page: fitz.Page) -> int:
+    """
+    מחזיר 90 אם העמוד כרגע לרוחב (Landscape) כדי להעמיד אותו למצב אנכי (Portrait),
+    או 0 אם העמוד כבר אנכי.
+    """
+    rect = page.rect  # כבר משקלל את page.rotation הקיים בקובץ
+    if rect.width > rect.height:
+        return 90
+    return 0
+
+
+def count_readable_chars(img: Image.Image) -> int:
+    """סופר תווים קריאים בעברית או באנגלית ב-OCR מהיר."""
+    try:
+        txt = pytesseract.image_to_string(img, lang="heb+eng", config="--psm 6")
+        return len(re.findall(r"[\u0590-\u05FFA-Za-z0-9]", txt))
+    except pytesseract.TesseractError:
+        try:
+            txt = pytesseract.image_to_string(img, lang="heb", config="--psm 6")
+            return len(re.findall(r"[\u0590-\u05FF0-9]", txt))
+        except pytesseract.TesseractError:
+            return 0
+
+
 def count_hebrew_chars(img: Image.Image) -> int:
     """סופר כמה תווים בעברית מזוהים ב-OCR מהיר."""
     try:
@@ -124,11 +174,17 @@ def count_hebrew_chars(img: Image.Image) -> int:
 def detect_rotation_angle(page: fitz.Page, dpi: int = 220) -> int:
     """
     מזהה כמה מעלות בכיוון השעון יש לסובב את העמוד כדי ליישר אותו.
+    אם הדף חלק או שלא מזוהה כיוון אותיות ברור — מיישר למצב אנכי (Portrait).
     מחזיר 0, 90, 180 או 270.
     """
     pix = page.get_pixmap(dpi=dpi)
     img = Image.open(io.BytesIO(pix.tobytes("png")))
 
+    # 1. בדיקת דף חלק -> יישור למצב אנכי
+    if is_blank_page(img):
+        return ensure_portrait_angle(page)
+
+    # 2. ניסיון זיהוי OSD מובנה של Tesseract
     osd_text = ""
     for lang in ("heb+eng", "eng", None):
         try:
@@ -145,25 +201,33 @@ def detect_rotation_angle(page: fitz.Page, dpi: int = 220) -> int:
     match = re.search(r"Rotate:\s*(\d+)", osd_text) if osd_text else None
     if match:
         angle = int(match.group(1)) % 360
-        if angle in (0, 180):
-            rot_0 = count_hebrew_chars(img)
-            rot_180 = count_hebrew_chars(img.rotate(180, expand=True))
-            if rot_180 > rot_0 * 1.3 and rot_180 >= 5:
-                return 180
-            return 0
-        return angle
+        rotated_candidate = img if angle == 0 else img.rotate(-angle, expand=True)
 
-    # גיבוי מלא אם OSD נכשל
+        # מוודא שאכן יש טקסט קריא בכיוון שזוהה (כדי למנוע זיהוי שגוי על קווים/חתימות)
+        if count_readable_chars(rotated_candidate) >= 5:
+            if angle in (0, 180):
+                rot_0 = count_hebrew_chars(img)
+                rot_180 = count_hebrew_chars(img.rotate(180, expand=True))
+                if rot_180 > rot_0 * 1.3 and rot_180 >= 5:
+                    return 180
+                return 0
+            return angle
+
+    # 3. גיבוי: בדיקת 4 כיוונים לפי כמות תווים קריאים
     best_angle = 0
     best_score = -1
     for candidate in (0, 90, 180, 270):
         rotated = img if candidate == 0 else img.rotate(-candidate, expand=True)
-        score = count_hebrew_chars(rotated)
+        score = count_readable_chars(rotated)
         if score > best_score:
             best_score = score
             best_angle = candidate
 
-    return best_angle if best_score >= 5 else 0
+    # אם לא זוהו מספיק אותיות ברורות -> מיישר למצב אנכי
+    if best_score < 5:
+        return ensure_portrait_angle(page)
+
+    return best_angle
 
 
 class PdfStraightenerApp:
@@ -429,65 +493,4 @@ class PdfStraightenerApp:
                 done += 1
                 page_label = f"{fdata['path'].name} - עמוד {p_idx + 1}/{len(doc)}"
                 self.root.after(0, lambda lbl=page_label, val=done: (
-                    self.status_var.set(f"מזהה כיוון: {lbl}..."),
-                    self.progress.config(value=val),
-                ))
-                angle = detect_rotation_angle(doc[p_idx])
-                fdata["rotations"][p_idx] = angle
-
-        def on_done() -> None:
-            self.btn_auto.config(state=tk.NORMAL)
-            self.btn_save.config(state=tk.NORMAL)
-            self.status_var.set("היישור האוטומטי הסתיים! בדוק ב-Preview וסובב ידנית עמודים שפוספסו.")
-            self._refresh_page_listbox()
-            self.render_preview()
-
-        self.root.after(0, on_done)
-
-    def save_all(self) -> None:
-        if not self.files_data:
-            return
-
-        if len(self.files_data) == 1:
-            fdata = self.files_data[0]
-            default_name = f"{fdata['path'].stem}_straightened.pdf"
-            out_file = filedialog.asksaveasfilename(
-                title="שמור קובץ PDF מיושר",
-                initialfile=default_name,
-                initialdir=str(fdata["path"].parent),
-                defaultextension=".pdf",
-                filetypes=[("PDF Files", "*.pdf")],
-            )
-            if not out_file:
-                return
-            self._write_single_pdf(fdata, Path(out_file))
-            messagebox.showinfo("נשמר בהצלחה", f"הקובץ נשמר אל:\n{out_file}")
-        else:
-            out_dir = filedialog.askdirectory(title="בחר תיקייה לשמירת הקבצים המיושרים")
-            if not out_dir:
-                return
-            target_dir = Path(out_dir)
-            for fdata in self.files_data:
-                dst_path = target_dir / f"{fdata['path'].stem}_straightened.pdf"
-                self._write_single_pdf(fdata, dst_path)
-            messagebox.showinfo("נשמר בהצלחה", f"נשמרו {len(self.files_data)} קבצים לתיקייה:\n{target_dir}")
-
-    @staticmethod
-    def _write_single_pdf(fdata: dict, dst_path: Path) -> None:
-        doc: fitz.Document = fdata["doc"]
-        out_doc = fitz.open()
-        try:
-            out_doc.insert_pdf(doc)
-            for p_idx, extra_rot in enumerate(fdata["rotations"]):
-                if extra_rot % 360 != 0:
-                    page = out_doc[p_idx]
-                    page.set_rotation((page.rotation + extra_rot) % 360)
-            out_doc.save(dst_path, garbage=4, deflate=True)
-        finally:
-            out_doc.close()
-
-
-if __name__ == "__main__":
-    root = tk.Tk()
-    app = PdfStraightenerApp(root)
-    root.mainloop()
+                    self.status_var.set(f"מזהה
